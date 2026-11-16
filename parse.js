@@ -133,45 +133,91 @@ function matchHtmlTag(s, i) {
 
 // GFM extended autolink helpers.
 const TRIM_CHARS = new Set('?!.,:;*_~"\'');
+// marked's _backpedal (url tokenizer): the longest prefix of the greedy
+// URL run that is a valid URL — good runs, balanced (...) groups,
+// entities, and punctuation runs not at the very end. A ] is a good
+// char (kept even trailing); a trailing ) or other punctuation is
+// dropped; a trailing ( group with no closing ) is dropped (doc-08).
+const BACKPEDAL = /(?:[^?!.,:;*_'\"~()&]+|\([^)]*\)|&(?![a-zA-Z0-9]+;$)|[?!.,:;*_'\"~)]+(?!$))+/;
 function trimExtendedUrl(u) {
-  // Greedy match already applied; apply the trim loop.
-  while (u.length > 0) {
-    // entity pattern at end: &[A-Za-z0-9][A-Za-z0-9]*;
-    const m = /&[A-Za-z0-9][A-Za-z0-9]*;$/.exec(u);
-    if (m) { u = u.slice(0, u.length - m[0].length); continue; }
-    const last = u[u.length - 1];
-    if (TRIM_CHARS.has(last)) { u = u.slice(0, -1); continue; }
-    if (last === ')') {
-      let open = 0, close = 0;
-      for (let k = 0; k < u.length; k++) { if (u[k] === '(') open++; else if (u[k] === ')') close++; }
-      if (u.endsWith('))') || close > open) { u = u.slice(0, -1); continue; }
-    }
-    if (last === ']') {
-      // a ] after an unmatched ) means the URL sits inside a link dest
-      // ( ... ) and the ] is the outer link bracket, not part of the URL
-      // (e.g. https://e.com)*] ); trimming it lets the loop then drop
-      // the * and the dest-closing ) as well. A ] with balanced parens
-      // (plain text, https://example.com/path]) is kept.
-      let open = 0, close = 0;
-      for (let k = 0; k < u.length; k++) { if (u[k] === '(') open++; else if (u[k] === ')') close++; }
-      if (close > open) { u = u.slice(0, -1); continue; }
-    }
-    break;
-  }
-  return u;
+  let r = u, t = BACKPEDAL.exec(u)?.[0] ?? '';
+  while (t !== r) { r = t; t = BACKPEDAL.exec(r)?.[0] ?? ''; }
+  return r;
 }
 // Greedy URL run: chars except whitespace and < ; a ( is included only if a
 // ) occurs later in the same run (before whitespace/< /end). When
 // stopAtBracket is set (a link bracket is open before the URL), a [ or ]
 // ends the run: it is the link's own bracket, not part of the URL (marked's
 // link token consumes it first, so the autolink never reaches it).
-function greedyUrl(s, i, stopAtBracket) {
+// does the ] at closePos close a bracket that will actually form a
+// link? Marked's De rejects a link whose label contains another link
+// (linkEmitted), so a bracket whose label holds a forming link does NOT
+// form — doc-08: the middle ] of [tool list [cache...](#to)](u) is
+// literal, and the bare URL autolink runs past it. Used by greedyUrl's
+// bracket stop. A bracket forms a link if it is an inline link or a
+// (full/collapsed/shortcut) reference link (doc-05: [license in
+// (http://...oak)][22]).
+function closeBracketFormsLink(s, closePos, refs) {
+  // find the matching [ (depth counting, \-aware)
+  let depth = 0, j = closePos - 1;
+  while (j >= 0) {
+    const c = s[j];
+    if (c === '\\') { j -= 2; continue; }
+    if (c === ']') { depth++; j--; continue; }
+    if (c === '[') {
+      if (depth === 0) break;
+      depth--; j--; continue;
+    }
+    j--;
+  }
+  if (j < 0 || s[j] !== '[') return false;
+  const formsInline = linkWillFormAt(s, j);
+  const formsRef = refs ? bracketFormsRefLink(s, j, refs) : false;
+  if (!formsInline && !formsRef) return false;
+  // the label must not contain a link (marked's De linkEmitted check)
+  return !labelContainsLink(s, j + 1, closePos, refs);
+}
+
+// does the bracket at [ position p form a (full/collapsed/shortcut)
+// reference link? (inline links are covered by linkWillFormAt)
+function bracketFormsRefLink(s, p, refs) {
+  const afterLabel = matchBracketGroup(s, p, true);
+  if (afterLabel === -1) return false;
+  const label = s.slice(p + 1, afterLabel - 1);
+  if (!labelTextValid(label)) return false;
+  const rl = parseRefLabel(s, afterLabel);
+  if (rl && rl.label !== '' && shortcutLabelValid(rl.label)) {
+    if (refs.get(normalizeLabel(rl.label))) return true;
+  }
+  if (rl && rl.label === '' && shortcutLabelValid(label)) {
+    if (refs.get(normalizeLabel(label))) return true;
+  }
+  if (shortcutLabelValid(label)) {
+    if (refs.get(normalizeLabel(label))) return true;
+  }
+  return false;
+}
+
+// does the span s[start..end) contain a [ that forms a link?
+function labelContainsLink(s, start, end, refs) {
+  for (let p = start; p < end; p++) {
+    if (s[p] === '[' && (linkWillFormAt(s, p) || (refs && bracketFormsRefLink(s, p, refs)))) return true;
+    if (s[p] === '\\') p++;
+  }
+  return false;
+}
+
+function greedyUrl(s, i, stopAtBracket, refs) {
   const n = s.length;
   let j = i;
   while (j < n) {
     const c = s[j];
     if (c === ' ' || c === '\t' || c === '\n' || c === '<') break;
-    if (stopAtBracket && (c === '[' || c === ']')) break;
+    // a bracket only stops the URL run if it opens/closes a link that
+    // will actually form; otherwise the bracket is part of the URL
+    // (marked's url tokenizer has no bracket awareness — doc-08)
+    if (stopAtBracket && c === '[') break;
+    if (stopAtBracket && c === ']' && closeBracketFormsLink(s, j, refs)) break;
     if (c === '(') {
       // find a ) later in this run
       let k = j + 1, ok = false;
@@ -214,7 +260,7 @@ let inlineInLink = false;
 // link turns out not to form (e.g. the [ sits inside a code span,
 // doc-01) the cap is a no-op because trimExtendedUrl already ends the
 // URL before the ).
-function linkDestCloseParen(s, urlPos) {
+function linkDestCloseParen(s, urlPos, refs) {
   // scan back over the dest run to its opening (
   let i = urlPos - 1;
   while (i >= 0 && !/\s/.test(s[i]) && s[i] !== '(' && s[i] !== ')' && s[i] !== '[' && s[i] !== ']') i--;
@@ -239,6 +285,10 @@ function linkDestCloseParen(s, urlPos) {
   if (afterLabel === -1) return -1;
   const label = s.slice(j + 1, afterLabel - 1);
   if (!labelTextValid(label)) return -1;
+  // the label must not contain a link (marked's De linkEmitted check);
+  // otherwise the link won't form and the ( ... ) is plain text, so a
+  // bare URL inside it autolinks past the ) (doc-08)
+  if (labelContainsLink(s, j + 1, afterLabel - 1, refs)) return -1;
   const il = parseInlineLink(s, afterLabel);
   if (!il) return -1;
   return il.end - 1; // the ) closing the dest
@@ -474,7 +524,7 @@ function tokenizeInline(s, refs) {
       const prev = i > 0 ? s[i - 1] : undefined;
       const okPrev = prev === undefined || isWS(prev) || prev === '(' || prev === '*' || prev === '_' || prev === '~';
       if (okPrev) {
-        const end = greedyUrl(s, i, openStack.length > 0);
+        const end = greedyUrl(s, i, openStack.length > 0, refs);
         if (end > i + 4) {
           const first = s.slice(i + 4, end);
           if (/^[A-Za-z0-9-]+(\.[A-Za-z0-9-]*)*/.test(first) && !first.startsWith('.') && !first.startsWith('_') && !first.startsWith('/') && first[0] !== '.') {
@@ -485,7 +535,7 @@ function tokenizeInline(s, refs) {
             let u = raw;
             u = trimExtendedUrl(u);
             // inside a link dest, cap the URL at the dest's closing )
-            const dc = linkDestCloseParen(s, i);
+            const dc = linkDestCloseParen(s, i, refs);
             if (dc !== -1 && i + u.length > dc) u = s.slice(i, dc);
             if (u.length > 4) { flushText(i); nodes.push({ t: 'autolink', url: 'http://' + u, text: u, pos: i, end: i + u.length }); i += u.length; textStart = i; continue; }
           }
@@ -494,14 +544,14 @@ function tokenizeInline(s, refs) {
     }
     if (!inlineInLink && (c === 'h' || c === 'H' || c === 'f' || c === 'F') && /^(?:https?|ftp):\/\//i.test(s.slice(i, i + 8))) {
       const m = /^(?:https?|ftp):\/\//i.exec(s.slice(i, i + 8));
-      const end = greedyUrl(s, i, openStack.length > 0);
+      const end = greedyUrl(s, i, openStack.length > 0, refs);
       const afterPrefix = s.slice(i + m[0].length, end);
       if (/^[A-Za-z0-9-]+(\.[A-Za-z0-9-]*)*/.test(afterPrefix) && afterPrefix[0] !== '.' && afterPrefix[0] !== '_' && afterPrefix[0] !== '/') {
         const raw = s.slice(i, end);
         let u = raw;
         u = trimExtendedUrl(u);
         // inside a link dest, cap the URL at the dest's closing )
-        const dc = linkDestCloseParen(s, i);
+        const dc = linkDestCloseParen(s, i, refs);
         if (dc !== -1 && i + u.length > dc) u = s.slice(i, dc);
         if (u.length > m[0].length) { flushText(i); nodes.push({ t: 'autolink', url: u, text: u, pos: i, end: i + u.length }); i += u.length; textStart = i; continue; }
       }
