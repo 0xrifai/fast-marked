@@ -223,12 +223,21 @@ function tokenizeInline(s, refs) {
       let j = i;
       while (j < n && s[j] === '`') j++;
       const run = j - i;
-      // find matching run; the scan must not cross a ] that closes the
-      // innermost open bracket when a link would form there (marked's
-      // link regex claims that ] first, so no code span may swallow it)
+      // find matching run; the scan must not cross a ] that closes a
+      // bracket opened BEFORE the code span when a link would form
+      // there (marked's link regex claims that ] first, so no code
+      // span may swallow it). A ] closing a bracket opened inside
+      // the prospective code span does not block it (cm-537).
+      // Backslashes are literal inside a code span: \` still closes
+      // it (cm-338) — only \[ / \] are treated as escaped brackets.
+      const isEscaped = (p) => {
+        let b = 0;
+        for (let q = p - 1; q >= 0 && s[q] === '\\'; q--) b++;
+        return b % 2 === 1;
+      };
       let k = j, found = -1, fend = -1, aborted = false;
       const baseDepth = openStack.length;
-      let depth = baseDepth;
+      let preScan = baseDepth; // pre-scan brackets still open
       const scanStack = openStack.slice();
       while (k < n) {
         if (s[k] === '`') {
@@ -236,37 +245,38 @@ function tokenizeInline(s, refs) {
           while (m < n && s[m] === '`') m++;
           if (m - k === run) { found = k; fend = m; break; }
           k = m;
-        } else if (s[k] === '\\' && k + 1 < n) {
-          k += 2;
-        } else if (s[k] === '[') {
+        } else if (s[k] === '[' && !isEscaped(k)) {
           const img = k > 0 && s[k - 1] === '!';
           scanStack.push({ pos: k, end: k + (img ? 2 : 1), image: img });
-          depth++;
           k++;
-        } else if (s[k] === ']' && depth === baseDepth && baseDepth > 0) {
-          const opener = scanStack[scanStack.length - 1];
-          const label = s.slice(opener.end, k);
-          let forms = false;
-          if (labelTextValid(label)) {
-            const after = k + 1;
-            if (parseInlineLink(s, after)) forms = true;
-            else {
-              const rl = parseRefLabel(s, after);
-              if (rl && rl.label !== '' && shortcutLabelValid(rl.label)) {
-                if (refs.get(normalizeLabel(rl.label))) forms = true;
-              } else if (rl && rl.label === '' && shortcutLabelValid(label)) {
-                if (refs.get(normalizeLabel(label))) forms = true;
-              } else if (!rl && shortcutLabelValid(label)) {
-                if (refs.get(normalizeLabel(label))) forms = true;
+        } else if (s[k] === ']' && !isEscaped(k)) {
+          if (scanStack.length > preScan) {
+            // closes a bracket opened inside the prospective code span
+            scanStack.pop();
+            k++;
+          } else if (preScan > 0) {
+            // closes the innermost pre-scan bracket: would a link form?
+            const opener = scanStack[scanStack.length - 1];
+            const label = s.slice(opener.end, k);
+            let forms = false;
+            if (labelTextValid(label)) {
+              const after = k + 1;
+              if (parseInlineLink(s, after)) forms = true;
+              else {
+                const rl = parseRefLabel(s, after);
+                if (rl && rl.label !== '' && shortcutLabelValid(rl.label)) {
+                  if (refs.get(normalizeLabel(rl.label))) forms = true;
+                } else if (rl && rl.label === '' && shortcutLabelValid(label)) {
+                  if (refs.get(normalizeLabel(label))) forms = true;
+                } else if (!rl && shortcutLabelValid(label)) {
+                  if (refs.get(normalizeLabel(label))) forms = true;
+                }
               }
             }
-          }
-          if (forms) { aborted = true; break; }
-          scanStack.pop(); depth--;
-          k++;
-        } else if (s[k] === ']' && depth > baseDepth) {
-          scanStack.pop(); depth--;
-          k++;
+            if (forms) { aborted = true; break; }
+            scanStack.pop(); preScan--;
+            k++;
+          } else k++;
         } else k++;
       }
       if (aborted) { i = j; continue; }
@@ -667,6 +677,117 @@ function stripAutolinks(first) {
 
 // Build the inline tree from tokenized nodes. s = source string, refs = Map.
 // Returns the head node of the top-level list.
+// Innermost still-open bracket at position pos (walking the node list
+// from head): pushes [ / ![ nodes, pops on ] nodes.
+function innermostOpenBracket(head, pos) {
+  const stack = [];
+  for (let cur = head; cur && cur.pos < pos; cur = cur.next) {
+    if (cur.t === 'open' && !cur.removed) stack.push(cur);
+    else if (cur.t === 'close' && !cur.removed && stack.length) stack.pop();
+  }
+  return stack.length ? stack[stack.length - 1] : null;
+}
+
+// Does bracket B (an open node) form a link? Find its closing ] by
+// depth-counting from fromPos, then check for ( / [ / a defined shortcut
+// ref. Returns the index of the closing ] or null.
+function bracketWillLinkFrom(B, fromPos, s, refs) {
+  let depth = 1, k = fromPos;
+  while (k < s.length) {
+    if (s[k] === '\\' && k + 1 < s.length) { k += 2; continue; }
+    if (s[k] === '[') depth++;
+    else if (s[k] === ']') { depth--; if (depth === 0) break; }
+    k++;
+  }
+  if (depth !== 0) return null;
+  const after = s[k + 1];
+  if (after === '(' || after === '[') return k;
+  const label = s.slice(B.end, k);
+  if (refs.has(normalizeLabel(label))) return k;
+  return null;
+}
+
+// marked's emStrong closer scan, over the delim nodes after opener op:
+// a nested opener-like run raises the delimiter requirement (m), a
+// both-flanking closer that violates the rule of 3 is skipped (f), and
+// a closer must cover m. Returns true if some closer covers m.
+// (e.g. *a **b**c* fails: the ** after b is both-flanking with
+// y=1,b=2 so (1+2)%3==0, it is skipped, and the final * cannot cover
+// m=3 — the outer * stays literal in marked.)
+// The scan is tried for every suffix of the opener run: marked tries
+// emStrong at each position inside a run, so **foo* can still pair
+// using the second * (k=1, y=2) even though the whole run (k=2) cannot.
+// o is set for suffixes: the char before the suffix is the same delim,
+// so a both-flanking candidate breaks the scan there.
+function openerCanPair(op, head, s, refs) {
+  const len = op.numDelims;
+  const before = op.pos > 0 ? s[op.pos - 1] : undefined;
+  const afterOp = op.end < s.length ? s[op.end] : undefined;
+  const pNonSpace = before !== undefined && !isWS(before);
+  const h = before === '*' || before === '_' || isPunct(before);
+  const d = isPunct(afterOp);
+  const R = pNonSpace && (d || (op.ch === '*' && !h));
+  // an opener inside a link's text cannot pair past that link's ]
+  const bOpen = innermostOpenBracket(head, op.pos);
+  let bOpenClose = -1;
+  if (bOpen && bOpen.pos < op.pos) {
+    const c = bracketWillLinkFrom(bOpen, op.pos, s, refs);
+    if (c !== null) bOpenClose = c;
+  }
+  for (let offset = 0; offset < len; offset++) {
+    const k = len - offset;
+    const y = len;
+    const o = offset > 0;
+    let m = k, f = 0;
+    let firstStar = true;
+    let ok = false;
+    for (let cur = op.next; cur; cur = cur.next) {
+      if (cur.t !== 'delim' || cur.ch !== op.ch || cur.removed || cur.parent) continue;
+      if (cur.numDelims <= 0) continue;
+      if (bOpenClose !== -1 && cur.pos > bOpenClose) continue;
+      // marked's closer regex first alternative skips a single * that
+      // sits between a __ pair at the start of the scan
+      // (^[^_*]*?__[^_*]*?\*[^_*]*?(?=__))
+      if (firstStar) {
+        firstStar = false;
+        const pre = s.slice(op.end, cur.pos);
+        if (/^[^_*]*?__[^_*]*?$/.test(pre) && /^[^_*]*?__/.test(s.slice(cur.end))) continue;
+      }
+      // a closer inside a to-be-link bracket is invisible to an opener
+      // outside that bracket
+      const b = innermostOpenBracket(head, cur.pos);
+      if (b && b.pos > op.pos && bracketWillLinkFrom(b, cur.pos, s, refs) !== null) continue;
+      const blen = cur.numDelims;
+      if (cur.canOpen && !cur.canClose) { m += blen; continue; }
+      if (cur.canOpen && cur.canClose) {
+        if (o) break; // previous char is the same delim: stop the scan
+        if (y % 3 !== 0 && (y + blen) % 3 === 0) { f += blen; continue; }
+      } else if (R) {
+        if (y % 3 !== 0 && (y + blen) % 3 === 0) { f += blen; continue; }
+      }
+      m -= blen;
+      if (m > 0) continue;
+      ok = true;
+      break;
+    }
+    if (ok) return true;
+  }
+  return false;
+}
+
+// Pre-pass: a * opener whose closer scan cannot cover the delimiter
+// requirement can never pair in marked's model — mark it dead so the
+// stack resolver does not pair it either. Runs before the main loop;
+// only sets a dead flag, never changes canOpen/canClose (the stack's
+// rule-of-3 check depends on them) or list structure.
+function markDeadStarOpeners(head, s, refs) {
+  for (let cur = head; cur; cur = cur.next) {
+    if (cur.t === 'delim' && cur.ch === '*' && cur.canOpen && cur.numDelims > 0) {
+      if (!openerCanPair(cur, head, s, refs)) cur.dead = true;
+    }
+  }
+}
+
 function buildInlineTree(s, refs) {
   const nodes = tokenizeInline(s, refs);
   if (nodes.length === 0) return null;
@@ -678,6 +799,7 @@ function buildInlineTree(s, refs) {
     if (nodes[i].t === 'delim') nodes[i].numDelims = nodes[i].len;
   }
   let head = nodes[0];
+  markDeadStarOpeners(head, s, refs);
   const delimStack = [];
   const bracketStack = [];
   let cur = head;
@@ -721,7 +843,7 @@ function buildInlineTree(s, refs) {
           let opener = null, oi = -1;
           for (let k = delimStack.length - 1; k >= 0; k--) {
             const o = delimStack[k];
-            if (o.removed || o.parent || o.numDelims <= 0 || !o.canOpen || o.ch !== cur.ch) continue;
+            if (o.removed || o.parent || o.dead || o.numDelims <= 0 || !o.canOpen || o.ch !== cur.ch) continue;
             if (o.pos < bracketPos) continue;
             // rule of 3: applies if EITHER delimiter can both open and close
             if (((o.canOpen && o.canClose) || (cur.canOpen && cur.canClose)) &&
@@ -768,11 +890,11 @@ function buildInlineTree(s, refs) {
           // closer still has delims: keep looking (it may match again)
         }
         if (cur && cur.removed) { cur = next; continue; }
-        if (cur && !cur.removed && cur.canOpen && cur.numDelims > 0) delimStack.push(cur);
+        if (cur && !cur.removed && cur.canOpen && !cur.dead && cur.numDelims > 0) delimStack.push(cur);
         cur = next;
         continue;
       }
-      if (!cur.removed && cur.canOpen && cur.numDelims > 0) delimStack.push(cur);
+      if (!cur.removed && cur.canOpen && !cur.dead && cur.numDelims > 0) delimStack.push(cur);
     } else if (cur.t === 'open') {
       bracketStack.push(cur);
     } else if (cur.t === 'close') {
