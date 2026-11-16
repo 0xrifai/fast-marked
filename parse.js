@@ -196,6 +196,15 @@ function isWS(c) { return c === undefined ? false : WS_RE.test(c); }
 function isPunct(c) { return c !== undefined && PUNCT_RE.test(c); }
 
 // Scan inline text into nodes. refs: Map of normalized label -> {dest, title}.
+// marked's Lexer keeps inLink state across the whole document: an
+// inline <a ...> tag (startATag /^<a /i — a space, so bare <a> does
+// not count) sets it, </a> clears it, and bare GFM autolinks
+// (www/scheme/email — marked's url tokenizer) are suppressed while it
+// is set. An unclosed <a> in one paragraph therefore suppresses bare
+// autolinks in later paragraphs (doc-30); angle-bracket autolinks are
+// not gated. Reset per parse() call.
+let inlineInLink = false;
+
 function tokenizeInline(s, refs) {
   const n = s.length;
   const nodes = [];
@@ -339,7 +348,13 @@ function tokenizeInline(s, refs) {
     // raw html / autolink <
     if (c === '<') {
       const e = matchHtmlTag(s, i);
-      if (e !== -1) { flushText(i); nodes.push({ t: 'html', s: s.slice(i, e), pos: i, end: e }); i = e; textStart = i; continue; }
+      if (e !== -1) {
+        flushText(i);
+        const tag = s.slice(i, e);
+        if (/^<a /i.test(tag)) inlineInLink = true;
+        else if (/^<\/a>/i.test(tag)) inlineInLink = false;
+        nodes.push({ t: 'html', s: tag, pos: i, end: e }); i = e; textStart = i; continue;
+      }
       // autolink <scheme:...> or <email>
       const m = /^<([A-Za-z][A-Za-z0-9+.-]{1,31}:[^<>\s]*)>/.exec(s.slice(i, i + 200)) ||
                 /^<([A-Za-z0-9.!#$%&'*+\/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)+)>/.exec(s.slice(i, i + 200));
@@ -364,7 +379,8 @@ function tokenizeInline(s, refs) {
     }
     // GFM extended autolinks: www. / scheme / email — only when not inside
     // a link text handled later; here we just detect at tokenize time.
-    if (c === 'w' && s.startsWith('www.', i)) {
+    // Suppressed while inlineInLink is set (unclosed <a> tag, doc-30).
+    if (c === 'w' && !inlineInLink && s.startsWith('www.', i)) {
       const prev = i > 0 ? s[i - 1] : undefined;
       const okPrev = prev === undefined || isWS(prev) || prev === '(' || prev === '*' || prev === '_' || prev === '~';
       if (okPrev) {
@@ -383,7 +399,7 @@ function tokenizeInline(s, refs) {
         }
       }
     }
-    if ((c === 'h' || c === 'H' || c === 'f' || c === 'F') && /^(?:https?|ftp):\/\//i.test(s.slice(i, i + 8))) {
+    if (!inlineInLink && (c === 'h' || c === 'H' || c === 'f' || c === 'F') && /^(?:https?|ftp):\/\//i.test(s.slice(i, i + 8))) {
       const m = /^(?:https?|ftp):\/\//i.exec(s.slice(i, i + 8));
       const end = greedyUrl(s, i, openStack.length > 0);
       const afterPrefix = s.slice(i + m[0].length, end);
@@ -397,7 +413,7 @@ function tokenizeInline(s, refs) {
     // email (bare, not in < >) — only try at the start of a word run;
     // a __ immediately before is emphasis, not part of the word
     const prevIsWord = i > 0 && /[A-Za-z0-9._+\-]/.test(s[i - 1]) && !(s[i - 1] === '_' && i >= 2 && s[i - 2] === '_');
-    if (/[A-Za-z0-9._+\-]/.test(c) && !prevIsWord) {
+    if (!inlineInLink && /[A-Za-z0-9._+\-]/.test(c) && !prevIsWord) {
       const atIdx = s.indexOf('@', i);
       if (atIdx !== -1 && atIdx - i < 200) {
         const m = /^[A-Za-z0-9._+\-]+@[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*\.[A-Za-z0-9_-]*[A-Za-z0-9]/.exec(s.slice(i, i + 300));
@@ -710,7 +726,8 @@ function bracketWillLinkFrom(B, fromPos, s, refs) {
 // marked's emStrong closer scan, over the delim nodes after opener op:
 // a nested opener-like run raises the delimiter requirement (m), a
 // both-flanking closer that violates the rule of 3 is skipped (f), and
-// a closer must cover m. Returns true if some closer covers m.
+// a closer must cover m. Returns the pairing {closer, use, tag} for the
+// first closer that covers m, or null.
 // (e.g. *a **b**c* fails: the ** after b is both-flanking with
 // y=1,b=2 so (1+2)%3==0, it is skipped, and the final * cannot cover
 // m=3 — the outer * stays literal in marked.)
@@ -719,8 +736,14 @@ function bracketWillLinkFrom(B, fromPos, s, refs) {
 // using the second * (k=1, y=2) even though the whole run (k=2) cannot.
 // o is set for suffixes: the char before the suffix is the same delim,
 // so a both-flanking candidate breaks the scan there.
-function openerCanPair(op, head, s, refs) {
-  const len = op.numDelims;
+// Delim counts come from the node's rem (remaining delims after
+// earlier openers' pairings consumed them, left-to-right as in
+// marked); returns {closer, use, tag, bPrime} where bPrime is the
+// capped closer length (min(b, b+m+f)) — the raw consumes bPrime
+// closer delims even when only `use` of them form the tag, so
+// bPrime-use extra delims land inside the em/strong text.
+function scanStarOpener(op, head, s, refs) {
+  const len = op.rem !== undefined ? op.rem : op.numDelims;
   const before = op.pos > 0 ? s[op.pos - 1] : undefined;
   const afterOp = op.end < s.length ? s[op.end] : undefined;
   const pNonSpace = before !== undefined && !isWS(before);
@@ -740,7 +763,6 @@ function openerCanPair(op, head, s, refs) {
     const o = offset > 0;
     let m = k, f = 0;
     let firstStar = true;
-    let ok = false;
     for (let cur = op.next; cur; cur = cur.next) {
       if (cur.t !== 'delim' || cur.ch !== op.ch || cur.removed || cur.parent) continue;
       if (cur.numDelims <= 0) continue;
@@ -757,7 +779,8 @@ function openerCanPair(op, head, s, refs) {
       // outside that bracket
       const b = innermostOpenBracket(head, cur.pos);
       if (b && b.pos > op.pos && bracketWillLinkFrom(b, cur.pos, s, refs) !== null) continue;
-      const blen = cur.numDelims;
+      const blen = cur.rem !== undefined ? cur.rem : cur.numDelims;
+      if (blen <= 0) continue;
       if (cur.canOpen && !cur.canClose) { m += blen; continue; }
       if (cur.canOpen && cur.canClose) {
         if (o) break; // previous char is the same delim: stop the scan
@@ -767,23 +790,48 @@ function openerCanPair(op, head, s, refs) {
       }
       m -= blen;
       if (m > 0) continue;
-      ok = true;
-      break;
+      // this closer covers m: marked uses b' = min(b, b+m+f) delims of
+      // it, and em iff min(k, b') is odd, else strong
+      const bPrime = Math.min(blen, blen + m + f);
+      const use = (Math.min(k, bPrime) % 2 === 1) ? 1 : 2;
+      return { closer: cur, use, tag: use === 2 ? 'strong' : 'em', bPrime };
     }
-    if (ok) return true;
   }
-  return false;
+  return null;
 }
 
-// Pre-pass: a * opener whose closer scan cannot cover the delimiter
-// requirement can never pair in marked's model — mark it dead so the
-// stack resolver does not pair it either. Runs before the main loop;
-// only sets a dead flag, never changes canOpen/canClose (the stack's
-// rule-of-3 check depends on them) or list structure.
+// Pre-pass: for each * opener, record the pairing marked's closer scan
+// finds (closer node, delims used, em/strong); an opener with no
+// closer is dead. The stack resolver enforces these pairings: an
+// opener reserved for another closer is skipped, so a * that marked's
+// scan skips (m not covered) never pairs with an earlier opener
+// (**public as *so*other* option html** pairs outer ** with final **).
+// Runs before the main loop; only sets flags, never changes list
+// structure. If two openers claim the same closer, the earlier one
+// wins and the later one is dead.
 function markDeadStarOpeners(head, s, refs) {
+  // remaining delims per * node: an earlier opener's pairing consumes
+  // bPrime delims of its closer, so a later opener's scan must not
+  // see them (marked processes left-to-right; the outer ** claims
+  // the final ** first, leaving nothing for the * inside it)
+  for (let cur = head; cur; cur = cur.next) {
+    if (cur.t === 'delim' && cur.ch === '*') cur.rem = cur.numDelims;
+  }
   for (let cur = head; cur; cur = cur.next) {
     if (cur.t === 'delim' && cur.ch === '*' && cur.canOpen && cur.numDelims > 0) {
-      if (!openerCanPair(cur, head, s, refs)) cur.dead = true;
+      const pair = scanStarOpener(cur, head, s, refs);
+      if (!pair) { cur.dead = true; continue; }
+      // a closer may be shared by several openers (its delims split),
+      // so a claimed closer does not kill this opener
+      cur.pairCloser = pair.closer;
+      cur.pairUse = pair.use;
+      cur.pairTag = pair.tag;
+      cur.pairBPrime = pair.bPrime;
+      pair.closer.pairOpener = cur;
+      // the pairing consumes `use` delims of the closer (bPrime is a
+      // raw length for text slicing, not a consumption — tokens nest,
+      // so shared closers split by use, e.g. *foo *bar** uses 1+1)
+      pair.closer.rem = Math.max(0, (pair.closer.rem !== undefined ? pair.closer.rem : pair.closer.numDelims) - pair.use);
     }
   }
 }
@@ -845,6 +893,14 @@ function buildInlineTree(s, refs) {
             const o = delimStack[k];
             if (o.removed || o.parent || o.dead || o.numDelims <= 0 || !o.canOpen || o.ch !== cur.ch) continue;
             if (o.pos < bracketPos) continue;
+            // recorded pairing (pre-pass scan): an opener reserved for
+            // another closer must not pair here — unless it has delims
+            // beyond its recorded use for an earlier closer (a *** run
+            // splits 2 for a strong + 1 for an em), and never with a
+            // closer after its recorded one (leftovers are literal)
+            if (o.pairCloser && o.pairCloser !== cur) {
+              if (!(o.pairCloser.pos > cur.pos && o.numDelims > o.pairUse)) continue;
+            }
             // rule of 3: applies if EITHER delimiter can both open and close
             if (((o.canOpen && o.canClose) || (cur.canOpen && cur.canClose)) &&
               (o.numDelims + cur.numDelims) % 3 === 0 &&
@@ -853,6 +909,13 @@ function buildInlineTree(s, refs) {
           }
           if (!opener) break;
           const isDel = cur.ch === '~';
+          // the recorded pairing only decides WHICH closer an opener
+          // pairs with (the reservation above); the delims used and
+          // tag come from the stack's default computation — marked's
+          // scan describes the outermost token, while the stack pairs
+          // innermost first (so applying the recorded use to the first
+          // pairing would nest em>em>em for ***x*** instead of
+          // em>strong)
           const use = isDel ? Math.min(opener.numDelims, cur.numDelims)
             : (opener.numDelims >= 2 && cur.numDelims >= 2) ? 2 : 1;
           const tag = isDel ? 'del' : use === 2 ? 'strong' : 'em';
@@ -875,7 +938,26 @@ function buildInlineTree(s, refs) {
           opener.next = emNode;
           cur.prev = emNode;
           opener.numDelims -= use;
-          cur.numDelims -= use;
+          // recorded pairing, last one between this opener and closer:
+          // marked's raw consumes bPrime delims of the closer, and
+          // the bPrime-use excess stays inside the em/strong text —
+          // minus the delims inner pairings already consumed from
+          // this closer (those are inside as inner tokens, not
+          // literal), e.g. **a *b*c*** keeps one trailing * inside
+          // the strong while *a *b **c**** d keeps none
+          let consumeC = use;
+          if (!isDel && opener.pairCloser === cur && opener.pairBPrime !== undefined &&
+            (opener.numDelims <= 0 || cur.numDelims - use <= 0)) {
+            const extra = Math.max(0, opener.pairBPrime - use - (cur.len - cur.numDelims));
+            consumeC = use + extra;
+            if (extra > 0) {
+              const lit = { t: 'text', s: cur.ch.repeat(extra), pos: cur.pos + use, end: cur.pos + consumeC, next: null, prev: null, parent: emNode, removed: false };
+              if (childTail) { childTail.next = lit; lit.prev = childTail; }
+              else { emNode.childHead = lit; }
+              childTail = lit;
+            }
+          }
+          cur.numDelims -= consumeC;
           if (opener.numDelims === 0) {
             unlink(opener);
             if (head === opener) head = emNode;
@@ -1989,6 +2071,7 @@ export function parse(markdown) {
   lines._inBlockquote = false;
   lines._srcEndsWithNL = src.endsWith('\n');
   const refs = new Map();
+  inlineInLink = false;
   const { blocks } = parseBlocks(lines, refs);
   return renderBlocks(blocks, refs, false);
 }
