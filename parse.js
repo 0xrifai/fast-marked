@@ -902,11 +902,15 @@ function stripBlockquoteMarker(t, startCol) {
   while (i < t.length && t[i] === ' ' && col - (startCol || 0) < 3) { i++; col++; }
   if (i >= t.length || t[i] !== '>') return null;
   i++; col++;
-  // whitespace run after `>`: expand its tabs, then drop one space
+  // whitespace run after `>`: expand its tabs, then drop one space.
+  // The expansion base is the marker's length WITHIN this text (the
+  // leading spaces + `>`), not the absolute column: marked re-lexes
+  // container-stripped text fresh, so a tab after `>` in `> \t...`
+  // expands from column 1 (doc-05/09/17/36: 2 spaces, not 4).
   let j = i;
   while (j < t.length && (t[j] === ' ' || t[j] === '\t')) j++;
   if (j === i) return { content: t.slice(i), newCol: col };
-  const expanded = expandLeadingTabs(t.slice(i), col);
+  const expanded = expandLeadingTabs(t.slice(i), i);
   // expanded starts with the run as spaces; drop exactly one of them
   return { content: expanded.slice(1), newCol: col + 1 };
 }
@@ -1294,7 +1298,9 @@ function parseBlocks(lines, refs, inListItem) {
           const cl = lines[i].text;
           const cm = /^ {0,3}(`{3,}|~{3,})[ \t]*$/.exec(cl);
           if (cm && cm[1][0] === fenceCh && cm[1].length >= fenceLen) { i++; break; }
-          contentLines.push(fenceDedent(cl, fenceWsLen));
+          // marked's Dt dedent regex only matches backtick fences: a
+          // tilde fence's content is never dedented (doc-22, t3/t5)
+          contentLines.push(fenceCh === '`' ? fenceDedent(cl, fenceWsLen) : cl);
           i++;
         }
         // exactly one trailing blank line is dropped (it is the newline
