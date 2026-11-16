@@ -205,6 +205,45 @@ function isPunct(c) { return c !== undefined && PUNCT_RE.test(c); }
 // not gated. Reset per parse() call.
 let inlineInLink = false;
 
+// the ) position closing a link destination that urlPos sits inside,
+// or -1. Marked's link tokenizer consumes [...](dest) before the url
+// tokenizer runs, so a bare autolink inside a dest must not reach past
+// the dest's closing ) — otherwise it swallows the ) and whatever
+// follows it (doc-26: the .! and the backslash hard break after a
+// scheme dest). The autolink is capped at the ), not suppressed: if the
+// link turns out not to form (e.g. the [ sits inside a code span,
+// doc-01) the cap is a no-op because trimExtendedUrl already ends the
+// URL before the ).
+function linkDestCloseParen(s, urlPos) {
+  // scan back over the dest run to its opening (
+  let i = urlPos - 1;
+  while (i >= 0 && !/\s/.test(s[i]) && s[i] !== '(' && s[i] !== ')' && s[i] !== '[' && s[i] !== ']') i--;
+  while (i >= 0 && /\s/.test(s[i])) i--;
+  if (i >= 0 && s[i] === '<') { i--; while (i >= 0 && /\s/.test(s[i])) i--; }
+  if (i < 0 || s[i] !== '(') return -1;
+  // the ( must directly follow a ] closing a bracket that forms a link
+  if (i - 1 < 0 || s[i - 1] !== ']') return -1;
+  let depth = 0, j = i - 2; // scan back from the char before the ]
+  while (j >= 0) {
+    const c = s[j];
+    if (c === '\\') { j -= 2; continue; }
+    if (c === ']') { depth++; j--; continue; }
+    if (c === '[') {
+      if (depth === 0) break;
+      depth--; j--; continue;
+    }
+    j--;
+  }
+  if (j < 0 || s[j] !== '[') return -1;
+  const afterLabel = matchBracketGroup(s, j, true);
+  if (afterLabel === -1) return -1;
+  const label = s.slice(j + 1, afterLabel - 1);
+  if (!labelTextValid(label)) return -1;
+  const il = parseInlineLink(s, afterLabel);
+  if (!il) return -1;
+  return il.end - 1; // the ) closing the dest
+}
+
 // marked's #n masking for the emStrong scan (Lexer#n in the bundle):
 // the scan runs over a masked copy of the inline text in which
 // backticks inside code spans and backslash-escaped punctuation become
@@ -445,6 +484,9 @@ function tokenizeInline(s, refs) {
             // stops before the closing ]
             let u = raw;
             u = trimExtendedUrl(u);
+            // inside a link dest, cap the URL at the dest's closing )
+            const dc = linkDestCloseParen(s, i);
+            if (dc !== -1 && i + u.length > dc) u = s.slice(i, dc);
             if (u.length > 4) { flushText(i); nodes.push({ t: 'autolink', url: 'http://' + u, text: u, pos: i, end: i + u.length }); i += u.length; textStart = i; continue; }
           }
         }
@@ -458,6 +500,9 @@ function tokenizeInline(s, refs) {
         const raw = s.slice(i, end);
         let u = raw;
         u = trimExtendedUrl(u);
+        // inside a link dest, cap the URL at the dest's closing )
+        const dc = linkDestCloseParen(s, i);
+        if (dc !== -1 && i + u.length > dc) u = s.slice(i, dc);
         if (u.length > m[0].length) { flushText(i); nodes.push({ t: 'autolink', url: u, text: u, pos: i, end: i + u.length }); i += u.length; textStart = i; continue; }
       }
     }
