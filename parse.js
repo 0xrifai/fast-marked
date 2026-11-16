@@ -205,6 +205,57 @@ function isPunct(c) { return c !== undefined && PUNCT_RE.test(c); }
 // not gated. Reset per parse() call.
 let inlineInLink = false;
 
+// marked's #n masking for the emStrong scan (Lexer#n in the bundle):
+// the scan runs over a masked copy of the inline text in which
+// backticks inside code spans and backslash-escaped punctuation become
+// '+' (anyPunctuationOutsideCode) and link / code-span / html-tag spans
+// become [aaa...] (blockSkip). All replacements are length-preserving,
+// so masked[i] lines up with s[i]. Delims inside a masked span are
+// invisible to the scan as closers; an opener inside one can still
+// pair with a closer after the span (k4), because openers are found in
+// the raw text while closers are found in the masked text.
+const MASK_ANY_PUNCT = /(`+)(?:[^`]|[^`][\s\S]*?[^`])\1(?!`)|`+|\\([\p{P}\p{S}])/gu;
+const MASK_BLOCKSKIP = /\[(?:[^\[\]`]|(?<a>`+)[^`]+\k<a>(?!`))*?\]\((?:\\[\s\S]|[^\\\(\)]|\((?:\\[\s\S]|[^\\\(\)])*\))*\)|(?<!`)(?<b>`+)[^`]+\k<b>(?!`)|<(?! )[^<>]*?>/g;
+function computeMaskedText(s) {
+  let t = s.replace(MASK_ANY_PUNCT, (n, run, esc) => {
+    if (esc) return '+'.repeat(n.length);
+    if (run) return run + n.slice(run.length, -run.length).replace(/`/g, '+') + run;
+    return n;
+  });
+  // blockSkip, but a link that WILL form is not masked: its text is
+  // re-lexed on its own in marked, so emphasis inside it resolves
+  // normally (k1/k6). Only spans that will not form a link are masked.
+  let out = '';
+  let last = 0;
+  MASK_BLOCKSKIP.lastIndex = 0;
+  let m;
+  while ((m = MASK_BLOCKSKIP.exec(t)) !== null) {
+    const start = m.index, end = start + m[0].length;
+    let maskIt = true;
+    if (t[start] === '[' && linkWillFormAt(s, start)) maskIt = false;
+    out += t.slice(last, start);
+    out += maskIt ? '[' + 'a'.repeat(Math.max(0, end - start - 2)) + ']' : t.slice(start, end);
+    last = end;
+    if (m[0].length === 0) MASK_BLOCKSKIP.lastIndex++;
+  }
+  out += t.slice(last);
+  return out;
+}
+// does an inline link (or image) form at s[p] === '['? label valid per
+// marked's re pattern and the (dest) parses
+function linkWillFormAt(s, p) {
+  const afterLabel = matchBracketGroup(s, p, true);
+  if (afterLabel === -1) return false;
+  const label = s.slice(p + 1, afterLabel - 1);
+  if (!labelTextValid(label)) return false;
+  return parseInlineLink(s, afterLabel) !== null;
+}
+// a delim run is visible to the emStrong scan iff it is intact in the
+// masked text (not swallowed by a masked link/code/html span)
+function delimVisibleInMask(node, masked) {
+  return masked.slice(node.pos, node.end) === node.ch.repeat(node.end - node.pos);
+}
+
 function tokenizeInline(s, refs) {
   const n = s.length;
   const nodes = [];
@@ -742,7 +793,7 @@ function bracketWillLinkFrom(B, fromPos, s, refs) {
 // capped closer length (min(b, b+m+f)) — the raw consumes bPrime
 // closer delims even when only `use` of them form the tag, so
 // bPrime-use extra delims land inside the em/strong text.
-function scanStarOpener(op, head, s, refs) {
+function scanStarOpener(op, head, s, refs, masked) {
   const len = op.rem !== undefined ? op.rem : op.numDelims;
   const before = op.pos > 0 ? s[op.pos - 1] : undefined;
   const afterOp = op.end < s.length ? s[op.end] : undefined;
@@ -767,6 +818,9 @@ function scanStarOpener(op, head, s, refs) {
       if (cur.t !== 'delim' || cur.ch !== op.ch || cur.removed || cur.parent) continue;
       if (cur.numDelims <= 0) continue;
       if (bOpenClose !== -1 && cur.pos > bOpenClose) continue;
+      // masked-span closers are invisible to the scan (marked's #n):
+      // the run is replaced by a/+ in the masked text
+      if (masked && !delimVisibleInMask(cur, masked)) continue;
       // marked's closer regex first alternative skips a single * that
       // sits between a __ pair at the start of the scan
       // (^[^_*]*?__[^_*]*?\*[^_*]*?(?=__))
@@ -809,7 +863,7 @@ function scanStarOpener(op, head, s, refs) {
 // Runs before the main loop; only sets flags, never changes list
 // structure. If two openers claim the same closer, the earlier one
 // wins and the later one is dead.
-function markDeadStarOpeners(head, s, refs) {
+function markDeadStarOpeners(head, s, refs, masked) {
   // remaining delims per * node: an earlier opener's pairing consumes
   // bPrime delims of its closer, so a later opener's scan must not
   // see them (marked processes left-to-right; the outer ** claims
@@ -819,7 +873,7 @@ function markDeadStarOpeners(head, s, refs) {
   }
   for (let cur = head; cur; cur = cur.next) {
     if (cur.t === 'delim' && cur.ch === '*' && cur.canOpen && cur.numDelims > 0) {
-      const pair = scanStarOpener(cur, head, s, refs);
+      const pair = scanStarOpener(cur, head, s, refs, masked);
       if (!pair) { cur.dead = true; continue; }
       // a closer may be shared by several openers (its delims split),
       // so a claimed closer does not kill this opener
@@ -847,7 +901,10 @@ function buildInlineTree(s, refs) {
     if (nodes[i].t === 'delim') nodes[i].numDelims = nodes[i].len;
   }
   let head = nodes[0];
-  markDeadStarOpeners(head, s, refs);
+  // masked text for the emStrong scan (marked's #n): delims inside a
+  // masked link/code/html span cannot close
+  const masked = computeMaskedText(s);
+  markDeadStarOpeners(head, s, refs, masked);
   const delimStack = [];
   const bracketStack = [];
   let cur = head;
@@ -855,8 +912,9 @@ function buildInlineTree(s, refs) {
     const next = cur.next;
     if (cur.removed || cur.parent) { cur = next; continue; }
     if (cur.t === 'delim') {
-      // try to close
-      if (cur.canClose && cur.numDelims > 0) {
+      // try to close (a closer inside a masked span is invisible to
+      // the emStrong scan and cannot pair; it may still open, k4)
+      if (cur.canClose && cur.numDelims > 0 && delimVisibleInMask(cur, masked)) {
         // innermost still-open bracket before this closer: openers at or
         // before it are outside the bracket pair and cannot match a
         // closer inside it -- but ONLY if that bracket will actually
