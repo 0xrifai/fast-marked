@@ -149,6 +149,21 @@ function trimExtendedUrl(u) {
 // stopAtBracket is set (a link bracket is open before the URL), a [ or ]
 // ends the run: it is the link's own bracket, not part of the URL (marked's
 // link token consumes it first, so the autolink never reaches it).
+// cached masked text for the paragraph currently being tokenized
+// (computeMaskedText is pure in s; tokenizeInline and buildInlineTree
+// run sequentially on the same s, so a single-entry cache is enough)
+let _maskedCacheS = null, _maskedCacheT = null;
+function maskedTextFor(s) {
+  if (s !== _maskedCacheS) { _maskedCacheS = s; _maskedCacheT = computeMaskedText(s); }
+  return _maskedCacheT;
+}
+// is the [ at position j visible (not swallowed by a masked code/link/
+// html span)? A [ inside a code span cannot form a link (doc-37:
+// the [ before `a` sits inside ` x [`).
+function bracketVisibleInMask(s, j) {
+  return maskedTextFor(s)[j] === '[';
+}
+
 // does the ] at closePos close a bracket that will actually form a
 // link? Marked's De rejects a link whose label contains another link
 // (linkEmitted), so a bracket whose label holds a forming link does NOT
@@ -171,6 +186,7 @@ function closeBracketFormsLink(s, closePos, refs) {
     j--;
   }
   if (j < 0 || s[j] !== '[') return false;
+  if (!bracketVisibleInMask(s, j)) return false;
   const formsInline = linkWillFormAt(s, j);
   const formsRef = refs ? bracketFormsRefLink(s, j, refs) : false;
   if (!formsInline && !formsRef) return false;
@@ -281,6 +297,7 @@ function linkDestCloseParen(s, urlPos, refs) {
     j--;
   }
   if (j < 0 || s[j] !== '[') return -1;
+  if (!bracketVisibleInMask(s, j)) return -1;
   const afterLabel = matchBracketGroup(s, j, true);
   if (afterLabel === -1) return -1;
   const label = s.slice(j + 1, afterLabel - 1);
