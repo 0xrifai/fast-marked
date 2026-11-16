@@ -1246,7 +1246,10 @@ function parseBlocks(lines, refs, inListItem) {
           i++;
           while (i < n) {
             const bl = lines[i];
-            if (bl.blank) break;
+            // a line of only spaces ends the table, but a line holding a
+            // tab is a row of empty cells (marked's table regex excludes
+            // only ` *\n` lines from the body; doc-26/33)
+            if (bl.blank && !bl.text.includes('\t')) break;
             if (blockStartKind(i, false)) break;
             table.rows.push(splitTableCells(bl.text));
             i++;
