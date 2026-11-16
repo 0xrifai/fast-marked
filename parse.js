@@ -161,13 +161,17 @@ function trimExtendedUrl(u) {
   return u;
 }
 // Greedy URL run: chars except whitespace and < ; a ( is included only if a
-// ) occurs later in the same run (before whitespace/< /end).
-function greedyUrl(s, i) {
+// ) occurs later in the same run (before whitespace/< /end). When
+// stopAtBracket is set (a link bracket is open before the URL), a [ or ]
+// ends the run: it is the link's own bracket, not part of the URL (marked's
+// link token consumes it first, so the autolink never reaches it).
+function greedyUrl(s, i, stopAtBracket) {
   const n = s.length;
   let j = i;
   while (j < n) {
     const c = s[j];
     if (c === ' ' || c === '\t' || c === '\n' || c === '<') break;
+    if (stopAtBracket && (c === '[' || c === ']')) break;
     if (c === '(') {
       // find a ) later in this run
       let k = j + 1, ok = false;
@@ -197,6 +201,10 @@ function tokenizeInline(s, refs) {
   const nodes = [];
   let i = 0;
   let textStart = 0;
+  // positions of unclosed [ / ![ openers, in scan order; a www/scheme
+  // autolink ends before a ] that would close one of them, and the code
+  // span scan below uses the same stack
+  const openStack = [];
   const flushText = (end) => {
     if (end > textStart) nodes.push({ t: 'text', s: s.slice(textStart, end), pos: textStart, end });
   };
@@ -215,16 +223,53 @@ function tokenizeInline(s, refs) {
       let j = i;
       while (j < n && s[j] === '`') j++;
       const run = j - i;
-      // find matching run
-      let k = j, found = -1, fend = -1;
+      // find matching run; the scan must not cross a ] that closes the
+      // innermost open bracket when a link would form there (marked's
+      // link regex claims that ] first, so no code span may swallow it)
+      let k = j, found = -1, fend = -1, aborted = false;
+      const baseDepth = openStack.length;
+      let depth = baseDepth;
+      const scanStack = openStack.slice();
       while (k < n) {
         if (s[k] === '`') {
           let m = k;
           while (m < n && s[m] === '`') m++;
           if (m - k === run) { found = k; fend = m; break; }
           k = m;
+        } else if (s[k] === '\\' && k + 1 < n) {
+          k += 2;
+        } else if (s[k] === '[') {
+          const img = k > 0 && s[k - 1] === '!';
+          scanStack.push({ pos: k, end: k + (img ? 2 : 1), image: img });
+          depth++;
+          k++;
+        } else if (s[k] === ']' && depth === baseDepth && baseDepth > 0) {
+          const opener = scanStack[scanStack.length - 1];
+          const label = s.slice(opener.end, k);
+          let forms = false;
+          if (labelTextValid(label)) {
+            const after = k + 1;
+            if (parseInlineLink(s, after)) forms = true;
+            else {
+              const rl = parseRefLabel(s, after);
+              if (rl && rl.label !== '' && shortcutLabelValid(rl.label)) {
+                if (refs.get(normalizeLabel(rl.label))) forms = true;
+              } else if (rl && rl.label === '' && shortcutLabelValid(label)) {
+                if (refs.get(normalizeLabel(label))) forms = true;
+              } else if (!rl && shortcutLabelValid(label)) {
+                if (refs.get(normalizeLabel(label))) forms = true;
+              }
+            }
+          }
+          if (forms) { aborted = true; break; }
+          scanStack.pop(); depth--;
+          k++;
+        } else if (s[k] === ']' && depth > baseDepth) {
+          scanStack.pop(); depth--;
+          k++;
         } else k++;
       }
+      if (aborted) { i = j; continue; }
       if (found !== -1) {
         flushText(i);
         let content = s.slice(j, found);
@@ -272,11 +317,13 @@ function tokenizeInline(s, refs) {
       const image = c === '!';
       flushText(i);
       nodes.push({ t: 'open', image, active: true, pos: i, end: i + (image ? 2 : 1) });
+      openStack.push({ pos: i, end: i + (image ? 2 : 1), image });
       i += image ? 2 : 1; textStart = i; continue;
     }
     if (c === ']') {
       flushText(i);
       nodes.push({ t: 'close', pos: i, end: i + 1 });
+      if (openStack.length) openStack.pop();
       i++; textStart = i; continue;
     }
     // raw html / autolink <
@@ -311,18 +358,15 @@ function tokenizeInline(s, refs) {
       const prev = i > 0 ? s[i - 1] : undefined;
       const okPrev = prev === undefined || isWS(prev) || prev === '(' || prev === '*' || prev === '_' || prev === '~';
       if (okPrev) {
-        const end = greedyUrl(s, i);
+        const end = greedyUrl(s, i, openStack.length > 0);
         if (end > i + 4) {
           const first = s.slice(i + 4, end);
           if (/^[A-Za-z0-9-]+(\.[A-Za-z0-9-]*)*/.test(first) && !first.startsWith('.') && !first.startsWith('_') && !first.startsWith('/') && first[0] !== '.') {
             const raw = s.slice(i, end);
-            // cut at ]( BEFORE trimming: a URL inside a link dest is
-            // followed by )**]... and the trim loop alone cannot strip
-            // the trailing ](v) (it stops at the v); cutting first lets
-            // the trim remove the ) and ** that precede it (doc-01)
+            // no ]( cut: a standalone www.…](x) keeps ](x) in the URL;
+            // inside link text the bracket-aware greedyUrl already
+            // stops before the closing ]
             let u = raw;
-            const br = u.indexOf('](');
-            if (br !== -1) u = u.slice(0, br);
             u = trimExtendedUrl(u);
             if (u.length > 4) { flushText(i); nodes.push({ t: 'autolink', url: 'http://' + u, text: u, pos: i, end: i + u.length }); i += u.length; textStart = i; continue; }
           }
@@ -331,13 +375,11 @@ function tokenizeInline(s, refs) {
     }
     if ((c === 'h' || c === 'H' || c === 'f' || c === 'F') && /^(?:https?|ftp):\/\//i.test(s.slice(i, i + 8))) {
       const m = /^(?:https?|ftp):\/\//i.exec(s.slice(i, i + 8));
-      const end = greedyUrl(s, i);
+      const end = greedyUrl(s, i, openStack.length > 0);
       const afterPrefix = s.slice(i + m[0].length, end);
       if (/^[A-Za-z0-9-]+(\.[A-Za-z0-9-]*)*/.test(afterPrefix) && afterPrefix[0] !== '.' && afterPrefix[0] !== '_' && afterPrefix[0] !== '/') {
         const raw = s.slice(i, end);
         let u = raw;
-        const br = u.indexOf('](');
-        if (br !== -1) u = u.slice(0, br);
         u = trimExtendedUrl(u);
         if (u.length > m[0].length) { flushText(i); nodes.push({ t: 'autolink', url: u, text: u, pos: i, end: i + u.length }); i += u.length; textStart = i; continue; }
       }
@@ -406,6 +448,79 @@ function tokenizeInline(s, refs) {
 
 // Parse an inline link destination/title starting at s[i] (just after ']').
 // Returns {dest, title, end} or null. dest/title are raw (unescaped) strings.
+// marked's link-label pattern (re): the raw text between [ and ] must be a
+// sequence of nested [...] groups (one level deep), backslash escapes,
+// code-span-like units (a backtick run, non-backtick chars, a backtick
+// run), a run of 2+ backticks immediately before the closing ], or any
+// char except [ ] \ `. A stray ] or an unmatched backtick makes the
+// label invalid and no link forms at this ].
+function matchBracketGroup(text, i, allowNested) {
+  // text[i] === '['; returns the index just past the matching ] or -1
+  let j = i + 1;
+  const n = text.length;
+  while (j < n) {
+    const d = text[j];
+    if (d === '\\') { j += 2; continue; }
+    if (d === ']') return j + 1;
+    if (d === '[') {
+      if (!allowNested) return -1;
+      const inner = matchBracketGroup(text, j, false);
+      if (inner === -1) return -1;
+      j = inner; continue;
+    }
+    j++;
+  }
+  return -1;
+}
+function labelTextValid(text) {
+  let i = 0;
+  const n = text.length;
+  while (i < n) {
+    const c = text[i];
+    if (c === '\\') { if (i + 1 >= n) return false; i += 2; continue; }
+    if (c === '[') {
+      const end = matchBracketGroup(text, i, true);
+      if (end === -1) return false;
+      i = end; continue;
+    }
+    if (c === '`') {
+      let j = i;
+      while (j < n && text[j] === '`') j++;
+      const run = j - i;
+      // a closing backtick run anywhere later?
+      let k = j;
+      while (k < n && text[k] !== '`') k++;
+      if (k < n) {
+        let m = k;
+        while (m < n && text[m] === '`') m++;
+        i = m; continue;
+      }
+      // no closing run: valid only as 2+ backticks at the very end
+      if (run >= 2 && j === n) { i = j; continue; }
+      return false;
+    }
+    if (c === ']') return false;
+    i++;
+  }
+  return true;
+}
+// marked's shortcut/collapsed reference label (le): no unescaped [ or ],
+// no newline followed by a blank line, not whitespace-only
+function shortcutLabelValid(text) {
+  if (!text || !/\S/.test(text)) return false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (c === '\\') { i++; continue; }
+    if (c === '[' || c === ']') return false;
+    if (c === '\n') {
+      let j = i + 1;
+      while (j < text.length && (text[j] === ' ' || text[j] === '\t')) j++;
+      if (j >= text.length || text[j] === '\n') return false;
+    }
+  }
+  return true;
+}
+
 function parseInlineLink(s, i) {
   const n = s.length;
   if (s[i] !== '(') return null;
@@ -677,21 +792,25 @@ function buildInlineTree(s, refs) {
         // try inline link
         const after = cur.end;
         let link = null, linkEnd = -1;
-        const il = parseInlineLink(s, after);
+        const text = s.slice(opener.end, cur.pos);
+        const il = labelTextValid(text) ? parseInlineLink(s, after) : null;
         if (il) { link = il; linkEnd = il.end; }
         else {
           const rl = parseRefLabel(s, after);
-          if (rl) {
-            // collapsed ref [] uses the link text itself as the label;
-            // the label is the RAW text between the brackets (emphasis
-            // markers and backticks included), not the rendered text
-            const label = rl.label === '' ? s.slice(opener.end, cur.pos) : rl.label;
-            const ref = refs.get(normalizeLabel(label));
+          // full ref: marked's reflink needs a valid link text (re) and
+          // a valid ref label (le); a syntactically valid but undefined
+          // ref leaves the [ literal — no shortcut fall-through
+          const fullOk = rl && rl.label !== '' && labelTextValid(text) && shortcutLabelValid(rl.label);
+          if (fullOk) {
+            const ref = refs.get(normalizeLabel(rl.label));
             if (ref) { link = { dest: ref.dest, title: ref.title }; linkEnd = rl.end; }
-          } else {
-            // shortcut reference
-            const label = s.slice(opener.end, cur.pos);
-            const ref = refs.get(normalizeLabel(label));
+          } else if (rl && rl.label === '' && shortcutLabelValid(text)) {
+            // collapsed ref: the text itself is the label
+            const ref = refs.get(normalizeLabel(text));
+            if (ref) { link = { dest: ref.dest, title: ref.title }; linkEnd = rl.end; }
+          } else if (!fullOk) {
+            // shortcut ref, only when no valid full/collapsed form claimed it
+            const ref = shortcutLabelValid(text) ? refs.get(normalizeLabel(text)) : undefined;
             if (ref) { link = { dest: ref.dest, title: ref.title }; linkEnd = after; }
           }
         }
