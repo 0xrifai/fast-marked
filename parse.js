@@ -8,12 +8,14 @@
 // starts a valid entity pattern (&word; / &#digits; / &#xhex;), otherwise &amp;.
 const NO_ENCODE_AMP = /&(?!(?:#\d{1,7};|#[xX][0-9a-fA-F]{1,6};|\w+;))/g;
 function escNoEncode(s) {
+  if (s.indexOf('&') === -1 && s.indexOf('<') === -1 && s.indexOf('>') === -1 && s.indexOf('"') === -1 && s.indexOf("'") === -1) return s;
   return s.replace(NO_ENCODE_AMP, '&amp;')
     .replace(/</g, '&lt;').replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
 // Encode variant (code spans / code blocks): every & becomes &amp;.
 function escEncode(s) {
+  if (s.indexOf('&') === -1 && s.indexOf('<') === -1 && s.indexOf('>') === -1 && s.indexOf('"') === -1 && s.indexOf("'") === -1) return s;
   return s.replace(/&/g, '&amp;')
     .replace(/</g, '&lt;').replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
@@ -21,6 +23,7 @@ function escEncode(s) {
 // Text escaping for inline content: & no-encode, < > " ' escaped.
 // (marked escapes quotes in text too.)
 function escText(s) {
+  if (s.indexOf('&') === -1 && s.indexOf('<') === -1 && s.indexOf('>') === -1 && s.indexOf('"') === -1 && s.indexOf("'") === -1) return s;
   return s.replace(NO_ENCODE_AMP, '&amp;')
     .replace(/</g, '&lt;').replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
@@ -853,13 +856,19 @@ function parseRefLabel(s, i) {
   return null;
 }
 
+const _normCache = new Map();
 function normalizeLabel(label) {
+  const hit = _normCache.get(label);
+  if (hit !== undefined) return hit;
   // only \[, \] and \\ are unescaped in a label (bracket chars and the
   // escape char itself); other backslash escapes stay literal, so
   // foo\! does NOT match foo! (cm-545), while ref\[ does match ref\[
   // (cm-549) and bar\\ matches bar\ (cm-550). Unicode casefold:
   // ẞ/ß fold to ss (cm-540).
-  return label.replace(/\\([\[\]\\])/g, '$1').replace(/\s+/g, ' ').trim().toLowerCase().replace(/ß/g, 'ss').replace(/ẞ/g, 'ss');
+  const out = label.replace(/\\([\[\]\\])/g, '$1').replace(/\s+/g, ' ').trim().toLowerCase().replace(/ß/g, 'ss').replace(/ẞ/g, 'ss');
+  if (_normCache.size > 4096) _normCache.clear();
+  _normCache.set(label, out);
+  return out;
 }
 
 // Plain text of a node list (for image alt and reference labels).
