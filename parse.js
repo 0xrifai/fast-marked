@@ -355,14 +355,23 @@ function tokenizeInline(s, refs) {
           // the last .label and re-check (foo@bar.com.a- -> foo@bar.com,
           // foo@bar.com- -> no match).
           let valid = true;
-          // inside __...__ the trailing __ is the emphasis closer, not
-          // part of the domain: do not cut the email back for a _
-          // that is part of that closer (doc-25/31/34/37/38)
-          const inUnderscoreEm = i >= 2 && s[i - 1] === '_' && s[i - 2] === '_';
+          // A trailing _ after the email is the emphasis closer, not
+          // part of the domain, only when an unmatched _ opener is
+          // still open: the nearest _ delimiter before the email must
+          // itself be an opener (a closer after it means that opener
+          // already closed, and a lone trailing _ kills the link).
+          // (doc-25/31/34/37/38: __...email__ / _...email_)
+          const trailingUnderscoreCloses = () => {
+            for (let k = nodes.length - 1; k >= 0; k--) {
+              const nd = nodes[k];
+              if (nd.t === 'delim' && nd.ch === '_') return nd.canOpen === true;
+            }
+            return false;
+          };
           while (true) {
             const after = s[i + email.length];
             if (after === undefined || !/[A-Za-z0-9_-]/.test(after)) break;
-            if (after === '_' && inUnderscoreEm) break;
+            if (after === '_' && trailingUnderscoreCloses()) break;
             const cut = email.lastIndexOf('.');
             const at = email.indexOf('@');
             if (cut <= at) { valid = false; break; }
@@ -828,6 +837,34 @@ function indentOf(t, startCol) {
   }
   return n - (startCol || 0);
 }
+// Expand the tabs in a leading run of spaces/tabs to spaces, tracking
+// columns from `startCol` (marked's J helper: a tab advances to the next
+// multiple of 4). Only the leading whitespace run is touched.
+function expandLeadingTabs(s, startCol) {
+  let col = startCol || 0, i = 0;
+  let out = '';
+  while (i < s.length && (s[i] === ' ' || s[i] === '\t')) {
+    if (s[i] === ' ') { out += ' '; col++; i++; }
+    else { const adv = 4 - (col % 4); out += ' '.repeat(adv); col += adv; i++; }
+  }
+  return out + s.slice(i);
+}
+// Fenced-code dedent (marked's Dt): remove up to `n` leading-whitespace
+// CHARACTERS from a content line, where n is the opening fence line's
+// leading-whitespace length. A tab counts as one character.
+function fenceDedent(line, n) {
+  if (n <= 0) return line;
+  let i = 0;
+  while (i < line.length && i < n && (line[i] === ' ' || line[i] === '\t')) i++;
+  return line.slice(i);
+}
+// Indented-code dedent (marked's codeRemoveIndent): remove 1-4 leading
+// spaces, or 0-3 spaces followed by a tab (the tab is removed, not expanded).
+function indentedCodeDedent(line) {
+  const m = /^(?: {0,3}\t| {1,4})/.exec(line);
+  return m ? line.slice(m[0].length) : line;
+}
+
 // column-aware: strip up to `count` columns of indent from the start of t,
 // where t starts at absolute column startCol. Returns {rest, newCol}.
 function stripIndent(t, count, startCol) {
@@ -856,19 +893,22 @@ function stripIndent(t, count, startCol) {
 }
 // Strip a blockquote marker (> + optional space/tab) from t (starting at
 // absolute column startCol). Returns {content, newCol} or null.
+// Marked's rule: the whitespace after `>` is tab-expanded (columns from
+// just after `>`), then the marker plus one space is removed — so
+// `> \tfoo` yields two spaces, `>\tfoo` yields two spaces, `>  \tfoo`
+// yields two spaces.
 function stripBlockquoteMarker(t, startCol) {
   let col = startCol || 0, i = 0;
   while (i < t.length && t[i] === ' ' && col - (startCol || 0) < 3) { i++; col++; }
   if (i >= t.length || t[i] !== '>') return null;
   i++; col++;
-  if (i < t.length && t[i] === ' ') { i++; col++; }
-  else if (i < t.length && t[i] === '\t') {
-    const adv = 4 - (col % 4);
-    const remaining = adv - 1;
-    i++;
-    return { content: ' '.repeat(remaining) + t.slice(i), newCol: col + 1 };
-  }
-  return { content: t.slice(i), newCol: col };
+  // whitespace run after `>`: expand its tabs, then drop one space
+  let j = i;
+  while (j < t.length && (t[j] === ' ' || t[j] === '\t')) j++;
+  if (j === i) return { content: t.slice(i), newCol: col };
+  const expanded = expandLeadingTabs(t.slice(i), col);
+  // expanded starts with the run as spaces; drop exactly one of them
+  return { content: expanded.slice(1), newCol: col + 1 };
 }
 
 // ---- tables ----
@@ -1243,7 +1283,9 @@ function parseBlocks(lines, refs, inListItem) {
         const fi = fenceInfo(t);
         const fenceCh = fi.ch;
         const fenceLen = fi.len;
-        const fenceIndent = indentOf(t, line.col);
+        // marked's Dt: dedent each content line by up to the opening
+        // fence line's leading-whitespace LENGTH (characters, not columns)
+        const fenceWsLen = /^[ \t]*/.exec(t)[0].length;
         let info = fi.info.split(/[ \t]+/)[0];
         info = info.replace(/\\([!"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~])/g, '$1');
         const contentLines = [];
@@ -1252,7 +1294,7 @@ function parseBlocks(lines, refs, inListItem) {
           const cl = lines[i].text;
           const cm = /^ {0,3}(`{3,}|~{3,})[ \t]*$/.exec(cl);
           if (cm && cm[1][0] === fenceCh && cm[1].length >= fenceLen) { i++; break; }
-          contentLines.push(fenceIndent > 0 ? stripIndent(cl, fenceIndent, lines[i].col).rest : cl);
+          contentLines.push(fenceDedent(cl, fenceWsLen));
           i++;
         }
         // exactly one trailing blank line is dropped (it is the newline
@@ -1316,13 +1358,13 @@ function parseBlocks(lines, refs, inListItem) {
           let j = i + 1;
           while (j < n && lines[j].blank) j++;
           if (j < n && indentOf(lines[j].text, lines[j].col) >= 4) {
-            while (i < j) { codeLines.push(stripIndent(lines[i].text, 4, lines[i].col).rest); i++; }
+            while (i < j) { codeLines.push(indentedCodeDedent(lines[i].text)); i++; }
             continue;
           }
           break;
         }
         if (indentOf(cl.text, cl.col) < 4) break;
-        codeLines.push(stripIndent(cl.text, 4, cl.col).rest);
+        codeLines.push(indentedCodeDedent(cl.text));
         i++;
       }
       // strip trailing blank lines
@@ -1446,28 +1488,27 @@ function listMarkerInfo(t, col) {
   let lead = 0;
   while (lead < t.length && t[lead] === ' ' && lead < 3) lead++;
   const markerEndCol = (col || 0) + lead + marker.length;
-  let pos = lead + marker.length;
-  let colPos = markerEndCol;
-  let sp = 0;
-  // scan ALL whitespace after the marker (spaces and tabs); the content
-  // indent is the expanded column unless the whitespace spans >= 5 columns
-  while (pos < t.length && (t[pos] === ' ' || t[pos] === '\t')) {
-    if (t[pos] === ' ') { sp++; colPos++; pos++; }
-    else {
-      const adv = 4 - (colPos % 4);
-      sp += adv; colPos += adv; pos++;
-    }
-    if (sp >= 5) break;
-  }
-  const empty = /^[ \t]*$/.test(t.slice(pos));
-  let contentIndent;
-  if (empty) contentIndent = markerEndCol + 1;
-  else if (sp >= 1 && sp <= 4) contentIndent = colPos;
-  else contentIndent = markerEndCol + 1;
-  // content = post-marker text with whitespace stripped up to contentIndent
-  // (a straddling tab is expanded to spaces by stripIndent)
+  // marked's list rule: expand the tabs in the whitespace after the
+  // marker (columns from the marker's end), then the content indent is
+  // the expanded whitespace's length in CHARACTERS — but when it exceeds
+  // 4 it is treated as 1 (so "-\\t\\tfoo" keeps six spaces of content
+  // and becomes indented code, cm-007).
   const afterMarker = t.slice(lead + marker.length);
-  const stripped = stripIndent(afterMarker, contentIndent - markerEndCol, markerEndCol);
+  const wsRun = /^[ \t]*/.exec(afterMarker)[0];
+  const expanded = expandLeadingTabs(wsRun, markerEndCol) + afterMarker.slice(wsRun.length);
+  const empty = /^[ \t]*$/.test(afterMarker);
+  let contentIndent, content, contentCol;
+  if (empty) {
+    contentIndent = markerEndCol + 1;
+    content = '';
+    contentCol = markerEndCol + 1;
+  } else {
+    let r = expanded.search(/[^ ]/);
+    if (r > 4) r = 1;
+    contentIndent = markerEndCol + r;
+    content = expanded.slice(r);
+    contentCol = markerEndCol + r;
+  }
   const isOrdered = /^\d/.test(marker);
   return {
     marker, isOrdered,
@@ -1475,8 +1516,8 @@ function listMarkerInfo(t, col) {
     delim: isOrdered ? marker[marker.length - 1] : null,
     start: isOrdered ? parseInt(marker, 10) : null,
     contentIndent,
-    content: stripped.rest,
-    contentCol: stripped.newCol,
+    content,
+    contentCol,
     empty,
     lead,
   };
@@ -1539,7 +1580,10 @@ function collectList(lines, startIdx, refs) {
       // an empty item cannot gain content after a blank line
       if (pendingBlanks > 0 && cur.lines.every(l => l.blank)) break;
       if (pendingBlanks > 0) { cur.blankBetween = true; for (let b = 0; b < pendingBlanks; b++) cur.lines.push({ text: '', lazy: false, col: line.col, blank: true }); pendingBlanks = 0; }
-      let stripped = stripIndent(line.text, curContentIndent, line.col);
+      // marked's list rule: expand leading tabs to spaces (columns from
+      // the line's own start), then drop the content-indent CHARACTERS
+      const expandedLine = expandLeadingTabs(line.text, 0);
+      const stripped = { rest: expandedLine.slice(curContentIndent), newCol: curContentIndent };
       // a would-be indented-code line (indent >= 4) has 4 columns stripped
       // when it continues an open paragraph inside the item; never strip a
       // nested list marker (it must keep its indent to nest correctly)
