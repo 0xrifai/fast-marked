@@ -2047,6 +2047,12 @@ function collectBlockquote(lines, startIdx, refs) {
 function listMarkerInfo(t, col) {
   const m = /^ {0,3}([*+-]|\d{1,9}[.)])/.exec(t);
   if (!m) return null;
+  // a marker must be followed by whitespace (or end of line): `*foo`
+  // and `**files...` are paragraphs, not list items (doc-04/18/35:
+  // a `**bold**` line after a blank line was swallowed as a 4th item
+  // and made the list loose)
+  const after = t.slice(m[0].length);
+  if (after !== '' && after[0] !== ' ' && after[0] !== '\t') return null;
   const marker = m[1];
   let lead = 0;
   while (lead < t.length && t[lead] === ' ' && lead < 3) lead++;
