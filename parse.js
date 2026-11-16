@@ -150,18 +150,19 @@ function trimExtendedUrl(u) {
 // ends the run: it is the link's own bracket, not part of the URL (marked's
 // link token consumes it first, so the autolink never reaches it).
 // cached masked text for the paragraph currently being tokenized
-// (computeMaskedText is pure in s; tokenizeInline and buildInlineTree
-// run sequentially on the same s, so a single-entry cache is enough)
-let _maskedCacheS = null, _maskedCacheT = null;
-function maskedTextFor(s) {
-  if (s !== _maskedCacheS) { _maskedCacheS = s; _maskedCacheT = computeMaskedText(s); }
+// (computeMaskedText is pure in s and refs; tokenizeInline and
+// buildInlineTree run sequentially on the same s, so a single-entry
+// cache is enough)
+let _maskedCacheS = null, _maskedCacheR = null, _maskedCacheT = null;
+function maskedTextFor(s, refs) {
+  if (s !== _maskedCacheS || refs !== _maskedCacheR) { _maskedCacheS = s; _maskedCacheR = refs; _maskedCacheT = computeMaskedText(s, refs); }
   return _maskedCacheT;
 }
 // is the [ at position j visible (not swallowed by a masked code/link/
 // html span)? A [ inside a code span cannot form a link (doc-37:
 // the [ before `a` sits inside ` x [`).
-function bracketVisibleInMask(s, j) {
-  return maskedTextFor(s)[j] === '[';
+function bracketVisibleInMask(s, j, refs) {
+  return maskedTextFor(s, refs)[j] === '[';
 }
 
 // does the ] at closePos close a bracket that will actually form a
@@ -186,7 +187,7 @@ function closeBracketFormsLink(s, closePos, refs) {
     j--;
   }
   if (j < 0 || s[j] !== '[') return false;
-  if (!bracketVisibleInMask(s, j)) return false;
+  if (!bracketVisibleInMask(s, j, refs)) return false;
   const formsInline = linkWillFormAt(s, j);
   const formsRef = refs ? bracketFormsRefLink(s, j, refs) : false;
   if (!formsInline && !formsRef) return false;
@@ -297,7 +298,7 @@ function linkDestCloseParen(s, urlPos, refs) {
     j--;
   }
   if (j < 0 || s[j] !== '[') return -1;
-  if (!bracketVisibleInMask(s, j)) return -1;
+  if (!bracketVisibleInMask(s, j, refs)) return -1;
   const afterLabel = matchBracketGroup(s, j, true);
   if (afterLabel === -1) return -1;
   const label = s.slice(j + 1, afterLabel - 1);
@@ -322,8 +323,64 @@ function linkDestCloseParen(s, urlPos, refs) {
 // the raw text while closers are found in the masked text.
 const MASK_ANY_PUNCT = /(`+)(?:[^`]|[^`][\s\S]*?[^`])\1(?!`)|`+|\\([\p{P}\p{S}])/gu;
 const MASK_BLOCKSKIP = /\[(?:[^\[\]`]|(?<a>`+)[^`]+\k<a>(?!`))*?\]\((?:\\[\s\S]|[^\\\(\)]|\((?:\\[\s\S]|[^\\\(\)])*\))*\)|(?<!`)(?<b>`+)[^`]+\k<b>(?!`)|<(?! )[^<>]*?>/g;
-function computeMaskedText(s) {
-  let t = s.replace(MASK_ANY_PUNCT, (n, run, esc) => {
+// reflinkSearch step of marked's #n (runs before anyPunct): mask
+// [...][ref], [...][], and [...] (shortcut, not followed by () spans
+// whose ref label is defined, so their contents (e.g. stray backticks
+// in [run ``response`][tool-91]) cannot form a code span that swallows
+// later emphasis (doc-35). A span whose label itself contains a link
+// is left unmasked (marked recurses into it via linkInText instead).
+function maskReflinks(s, refs) {
+  if (!refs || refs.size === 0 || !s.includes('[')) return s;
+  let out = '', i = 0;
+  const n = s.length;
+  while (i < n) {
+    // an image ref link starts with ![
+    let start = i, isImage = false;
+    if (s[i] === '!' && i + 1 < n && s[i + 1] === '[') { start = i; isImage = true; i++; }
+    if (s[i] === '[') {
+      const p = i;
+      const afterLabel = matchBracketGroup(s, p, true);
+      if (afterLabel !== -1) {
+        const label = s.slice(p + 1, afterLabel - 1);
+        if (labelTextValid(label) && !labelContainsLink(s, p + 1, afterLabel - 1, refs)) {
+          const rl = parseRefLabel(s, afterLabel);
+          let end = -1;
+          if (rl && rl.label !== '' && shortcutLabelValid(rl.label) && refs.has(normalizeLabel(rl.label))) end = rl.end;
+          else if (rl && rl.label === '' && shortcutLabelValid(label) && refs.has(normalizeLabel(label))) end = rl.end;
+          else if (shortcutLabelValid(label) && refs.has(normalizeLabel(label)) && s[afterLabel] !== '(') end = afterLabel;
+          // only mask when the span holds a backtick: that is the
+          // hazard (a stray ` starts a code span in the masked text
+          // that swallows later emphasis, doc-35). Without a backtick
+          // there is nothing to hide, and masking would hide emphasis
+          // inside the label (cm-530/554/573) or disturb nearby
+          // delims (doc-29).
+          if (end !== -1 && s.slice(start, end).includes('`')) {
+            const span = s.slice(start, end);
+            let masked = '';
+            for (const ch of span) masked += (ch === '*' || ch === '_' || ch === '~') ? ch : 'a';
+            masked = '[' + masked.slice(1, -1) + ']';
+            out += masked;
+            i = end;
+            continue;
+          }
+        }
+      }
+      // not a defined ref link: emit the [ (and the ! if any) as-is
+      out += s.slice(start, p + 1);
+      i = p + 1;
+      continue;
+    }
+    out += s[i];
+    i++;
+  }
+  return out;
+}
+
+function computeMaskedText(s, refs) {
+  // reflinkSearch first: defined ref links are masked before anyPunct
+  // so their contents cannot start a code span (doc-35)
+  let t = maskReflinks(s, refs);
+  t = t.replace(MASK_ANY_PUNCT, (n, run, esc) => {
     if (esc) return '+'.repeat(n.length);
     if (run) return run + n.slice(run.length, -run.length).replace(/`/g, '+') + run;
     return n;
@@ -1015,7 +1072,7 @@ function buildInlineTree(s, refs) {
   let head = nodes[0];
   // masked text for the emStrong scan (marked's #n): delims inside a
   // masked link/code/html span cannot close
-  const masked = computeMaskedText(s);
+  const masked = computeMaskedText(s, refs);
   markDeadStarOpeners(head, s, refs, masked);
   const delimStack = [];
   const bracketStack = [];
