@@ -330,7 +330,7 @@ const MASK_BLOCKSKIP = /\[(?:[^\[\]`]|(?<a>`+)[^`]+\k<a>(?!`))*?\]\((?:\\[\s\S]|
 // later emphasis (doc-35). A span whose label itself contains a link
 // is left unmasked (marked recurses into it via linkInText instead).
 function maskReflinks(s, refs) {
-  if (!refs || refs.size === 0 || !s.includes('[')) return s;
+  if (!refs || refs.size === 0 || !s.includes('[') || !s.includes('`')) return s;
   let out = '', i = 0;
   const n = s.length;
   while (i < n) {
@@ -377,6 +377,10 @@ function maskReflinks(s, refs) {
 }
 
 function computeMaskedText(s, refs) {
+  // fast path: the anyPunct/blockSkip patterns can only match a
+  // backtick, a [, a <, or a backslash-escaped punctuation; with none
+  // of those the masked text is the raw text
+  if (!s.includes('`') && !s.includes('[') && !s.includes('<') && !s.includes('\\')) return s;
   // reflinkSearch first: defined ref links are masked before anyPunct
   // so their contents cannot start a code span (doc-35)
   let t = maskReflinks(s, refs);
@@ -1071,8 +1075,9 @@ function buildInlineTree(s, refs) {
   }
   let head = nodes[0];
   // masked text for the emStrong scan (marked's #n): delims inside a
-  // masked link/code/html span cannot close
-  const masked = computeMaskedText(s, refs);
+  // masked link/code/html span cannot close (reuse the cache:
+  // tokenizeInline may already have computed it for this paragraph)
+  const masked = maskedTextFor(s, refs);
   markDeadStarOpeners(head, s, refs, masked);
   const delimStack = [];
   const bracketStack = [];
