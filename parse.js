@@ -1808,10 +1808,14 @@ function parseBlocks(lines, refs, inListItem) {
           while (i < n && !lines[i].blank) { htmlLines.push(lines[i].text); i++; }
         }
         let htmlText = htmlLines.join('\n');
-        // trailing \n: types 1-5 include it when the next line is non-blank
-        // (or at EOF with source ending \n); types 6-7 only at EOF.
+        // trailing \n: types 1-5 include it (marked's html regex takes
+        // the newline after the closing line and ge() keeps it) unless
+        // the next line is truly empty — then the regex takes \n\n and
+        // ge() strips both. A whitespace-only next line (\t, space)
+        // still gets the \n: the regex stops at the tab, ge() keeps
+        // the single newline (doc-15/19/22/24).
         if (hb.type <= 5) {
-          if (i < n && !isBlankLine(lines[i].text)) htmlText += '\n';
+          if (i < n && lines[i].text !== '') htmlText += '\n';
           else if (i >= n && srcEndsWithNL) htmlText += '\n';
         } else {
           if (i >= n && srcEndsWithNL) htmlText += '\n';
